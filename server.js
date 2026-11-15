@@ -60,6 +60,24 @@ const SORT_WHITELIST = Object.freeze({
   views: (a, b) => (b.views !== a.views ? b.views - a.views : b.id - a.id)
 });
 
+// [수정] 쿼리 값이 문자열일 때만 사용 (?search=a&search=b 처럼 배열로 들어오면 무시)
+function toQueryString(value) {
+  return typeof value === 'string' ? value : '';
+}
+
+// [수정] 정렬 키 검증: 객체가 "직접 가진" 키만 허용
+// SORT_WHITELIST[key]는 프로토타입까지 조회하므로 __proto__, constructor, hasOwnProperty 등이 통과됨
+function resolveSortKey(value) {
+  const key = toQueryString(value);
+  return Object.hasOwn(SORT_WHITELIST, key) ? key : 'latest';
+}
+
+// [수정] 제목·본문 검색 조건을 오프셋/커서 API가 함께 사용 (WHERE title LIKE ? OR content LIKE ?)
+function matchesSearch(post, search) {
+  if (!search) return true;
+  return post.title.toLowerCase().includes(search) || post.content.toLowerCase().includes(search);
+}
+
 // ==========================================
 // 1. 오프셋 기반 페이지네이션 API
 // GET /api/posts?page=1&limit=10&sort=views&search=인덱스
@@ -72,18 +90,14 @@ app.get('/api/posts', (req, res) => {
   const rawLimit = parseInt(req.query.limit, 10);
   const page = (!isNaN(rawPage) && rawPage > 0) ? rawPage : 1;
   const limit = (!isNaN(rawLimit) && rawLimit > 0) ? Math.min(rawLimit, 100) : 10;
-  const search = (req.query.search || '').trim().toLowerCase();
-  const sortKey = req.query.sort || 'latest';
+  const search = toQueryString(req.query.search).trim().toLowerCase();
+  const sortKey = resolveSortKey(req.query.sort);
 
   // 1) 검색 필터링 (WHERE title LIKE '%search%')
-  let filtered = POSTS.filter(p => {
-    if (!search) return true;
-    return p.title.toLowerCase().includes(search) || p.content.toLowerCase().includes(search);
-  });
+  let filtered = POSTS.filter(p => matchesSearch(p, search));
 
   // 2) 화이트리스트 정렬 (ORDER BY ...)
-  const sortComparator = SORT_WHITELIST[sortKey] || SORT_WHITELIST.latest;
-  filtered.sort(sortComparator);
+  filtered.sort(SORT_WHITELIST[sortKey]);
 
   // 3) 오프셋 계산 및 데이터 슬라이싱
   const totalCount = filtered.length;
@@ -101,6 +115,7 @@ app.get('/api/posts', (req, res) => {
     meta: {
       page: safePage,
       limit,
+      sort: sortKey, // [수정] 서버가 실제 적용한 정렬 키 (잘못된 값이면 latest)
       totalCount,
       totalPages,
       hasNext: safePage < totalPages,
@@ -112,21 +127,26 @@ app.get('/api/posts', (req, res) => {
 
 // ==========================================
 // 2. 커서 기반(Keyset) 페이지네이션 API
-// GET /api/posts/cursor?cursor=950&limit=10
+// GET /api/posts/cursor?cursor=950&limit=10&search=인덱스
+// 정렬은 id DESC 고정 (sort 파라미터는 사용하지 않음)
 // ==========================================
 app.get('/api/posts/cursor', (req, res) => {
   const startTime = process.hrtime();
 
   const rawCursor = parseInt(req.query.cursor, 10);
+  const cursor = (!isNaN(rawCursor) && rawCursor > 0) ? rawCursor : null;
   const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 10), 50);
+  const search = toQueryString(req.query.search).trim().toLowerCase();
 
-  // 커서가 있으면 해당 id보다 작은 항목들만 탐색 (WHERE id < ? ORDER BY id DESC)
-  let candidate = POSTS;
-  if (!isNaN(rawCursor) && rawCursor > 0) {
-    candidate = POSTS.filter(p => p.id < rawCursor);
-  }
+  // [수정] 검색 조건 + 커서 조건을 먼저 모두 적용한 뒤 id DESC 정렬
+  // (WHERE (title LIKE ? OR content LIKE ?) AND id < ? ORDER BY id DESC)
+  const candidate = POSTS
+    .filter(p => matchesSearch(p, search))
+    .filter(p => cursor === null || p.id < cursor)
+    .sort((a, b) => b.id - a.id);
 
   // limit + 1개를 조회하여 다음 데이터 존재 여부(hasNext) 판단 (COUNT(*) 제거)
+  // 반드시 조건 적용 "후"에 잘라야 함: 먼저 자르면 검색 결과가 남아 있어도 hasNext=false가 될 수 있음
   const sliced = candidate.slice(0, limit + 1);
   const hasNext = sliced.length > limit;
   const items = hasNext ? sliced.slice(0, limit) : sliced;
@@ -139,9 +159,11 @@ app.get('/api/posts/cursor', (req, res) => {
   res.json({
     items,
     meta: {
-      cursor: rawCursor || null,
+      cursor,
       nextCursor,
       limit,
+      search, // [수정] 서버가 적용한 검색어
+      order: 'id DESC', // [수정] 커서 정렬 기준 명시
       hasNext,
       executionTimeMs: Number(executionTimeMs)
     }
