@@ -230,7 +230,7 @@
       </select>
       <button class="btn" onclick="applySearch()">조회</button>
     </div>
-    <!-- [수정] 커서 모드에서는 정렬 선택을 비활성화하고 정렬 기준을 명시 -->
+    <!-- [커서 페이징] 커서 모드에서는 정렬 선택을 비활성화하고 정렬 기준을 명시 -->
     <p id="cursorSortNote" style="display:none; margin:-6px 0 14px; font-size:13px; color:var(--muted);">
       커서 모드는 <b>id DESC(최신 글 → 오래된 글) 고정</b>입니다. 정렬 선택은 오프셋 모드에서만 적용됩니다.
     </p>
@@ -308,10 +308,10 @@
   let cursorPosts = []; // 커서 모드 누적 아이템
   let currentAbortController = null;
   let debounceTimer = null;
-  let latestRequestId = 0; // [수정] 가장 최근 요청 번호 (오래된 응답 무시용)
-  const SORT_KEYS = ['latest', 'views', 'oldest']; // [수정] 서버 SORT_WHITELIST와 동일
+  let latestRequestId = 0; // [Race Condition] 가장 최근 요청 번호 (오래된 응답 무시용)
+  const SORT_KEYS = ['latest', 'views', 'oldest']; // [정렬 보안] 서버 SORT_WHITELIST와 동일
 
-  // [수정] 화면(탭·페이징 바·정렬 선택)만 모드에 맞게 바꿈. 데이터 로드는 하지 않음
+  // [커서 페이징] 화면(탭·페이징 바·정렬 선택)만 모드에 맞게 바꿈. 데이터 로드는 하지 않음
   function applyModeUI(newMode) {
     mode = newMode;
     document.getElementById('tabOffset').classList.toggle('active', mode === 'offset');
@@ -322,7 +322,7 @@
     document.getElementById('cursorSortNote').style.display = (mode === 'cursor') ? 'block' : 'none';
   }
 
-  // [수정] 커서 모드 누적 목록·커서 초기화 (검색어 변경, 모드 전환 시)
+  // [커서 페이징] 커서 모드 누적 목록·커서 초기화 (검색어 수정, 조회, 페이징 모드, URL 복원 시)
   function resetCursor() {
     state.cursor = null;
     state.hasNext = true;
@@ -331,7 +331,7 @@
 
   // 모드 변경 (오프셋 vs 커서)
   function switchMode(newMode) {
-    clearTimeout(debounceTimer); // [수정] 대기 중인 디바운스 요청이 모드 전환 뒤에 끼어들지 않게 함
+    clearTimeout(debounceTimer); // [비동기 요청 개선] 대기 중인 디바운스 요청이 모드 전환 뒤에 끼어들지 않게 함
     applyModeUI(newMode);
     state.search = document.getElementById('searchInput').value.trim(); // 입력창과 상태를 일치시킴
     state.page = 1;
@@ -346,7 +346,7 @@
     }
     currentAbortController = new AbortController();
     const { signal } = currentAbortController;
-    const requestId = ++latestRequestId; // [수정] 이 요청의 번호
+    const requestId = ++latestRequestId; // 최신 요청 번호를 1 더하고, 그 값을 이 요청의 번호로 저장(도착한 응답이 최신 요청에 따른 것인지 확인)
     const requestMode = mode;
 
     const t0 = performance.now();
@@ -356,7 +356,7 @@
       endpoint = `/api/posts?${buildOffsetQuery().toString()}`;
     } else {
       const q = new URLSearchParams({ limit: state.limit });
-      if (state.search) q.set('search', state.search); // [수정] 커서 API에도 검색어 전달
+      if (state.search) q.set('search', state.search); // [검색 기능 개선] 기존에 커서 모드에서는 검색이 안되는 문제에 대해 API에도 검색어 전달하여 검색기능 개선
       if (state.cursor) q.set('cursor', state.cursor);
       endpoint = `/api/posts/cursor?${q.toString()}`;
     }
@@ -365,10 +365,10 @@
 
     try {
       const res = await fetch(endpoint, { signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`); // [수정] 4xx/5xx 응답도 에러로 처리
+      if (!res.ok) throw new Error(`HTTP ${res.status}`); // [에러 처리] 4xx/5xx 응답도 에러로 처리
       const json = await res.json();
 
-      // [수정] 그사이 더 새로운 요청이 시작됐다면 이 응답은 버림 (오래된 응답의 화면 덮어쓰기 방지)
+      // [Race Condition] 요청 대기(처리) 중 더 새로운 요청이 시작됐다면 이 응답은 버림 (오래된 응답의 화면 덮어쓰기 방지)
       if (requestId !== latestRequestId) return;
 
       const t1 = performance.now();
@@ -377,7 +377,7 @@
       document.getElementById('inspectJson').textContent = JSON.stringify(json, null, 2);
 
       if (requestMode === 'offset') {
-        // [수정] 서버가 보정한 page·sort를 상태와 화면에 반영 (page=999 → 100, sort=hack → latest)
+        // [URL 상태 복원] 서버가 보정한 page 및 sort를 state와 정렬 선택창에 반영되도록 함 (ex. page=999 → 100, sort=hack → latest)
         state.page = json.meta.page;
         state.sort = json.meta.sort;
         document.getElementById('sortSelect').value = state.sort;
@@ -400,7 +400,7 @@
         // 취소는 정상 흐름: 화면을 건드리지 않음 (새 요청이 화면을 그림)
         console.log('[AbortController] 이전 비동기 요청이 정상 취소되었습니다.');
       } else if (requestId === latestRequestId) {
-        // [수정] 최신 요청이 실패한 경우에만 사용자에게 오류 표시
+        // [에러 처리] 최신 요청이 실패한 경우에만 사용자에게 오류 표시(이미 다른 요청으로 대체된 요청의 실패는 무시)
         console.error('Fetch error:', err);
         document.getElementById('tableBody').innerHTML =
           '<tr><td colspan="5" style="text-align:center; padding:30px; color:#d9383a;">목록을 불러오지 못했습니다. 잠시 후 다시 시도하세요.</td></tr>';
@@ -408,7 +408,7 @@
     }
   }
 
-  // [수정] 오프셋 모드 상태 → URLSearchParams (API 요청과 주소창이 같은 형식을 사용)
+  // [URL 검색 요청 동기화] 오프셋 모드 상태 → URLSearchParams (API 요청과 주소창이 같은 형식을 반영하도록 함)
   function buildOffsetQuery() {
     const q = new URLSearchParams({
       page: state.page,
@@ -419,7 +419,7 @@
     return q;
   }
 
-  // [수정] 응답을 받은 "후" 서버가 보정한 값으로 주소창을 맞춤
+  // [URL 검색 결과 동기화] 응답을 받은 "후" 서버가 규칙에 맞게 보정한 값(페이지, 정렬 기준 등)으로 주소창을 맞춤
   // 사용자 조작은 pushState(뒤로 가기 기록 추가), 새로고침·뒤로 가기 복원은 replaceState(기록 추가 없이 교정)
   function syncUrl(pushHistory) {
     const url = `?${buildOffsetQuery().toString()}`;
@@ -431,7 +431,7 @@
     }
   }
 
-  // [수정] 주소창 → 상태 복원 (새로고침·뒤로 가기 공용). 잘못된 값은 기본값으로 정제
+  // [URL 상태 복원] 주소창의 page/sort/search를 읽어 state, 입력창, 정렬 선택창을 복원함(새로고침 및 뒤로 가기 공용), 또한 모드는 오프셋으로 전환
   function restoreFromUrl() {
     const params = new URLSearchParams(window.location.search);
     const rawPage = parseInt(params.get('page'), 10);
@@ -499,7 +499,7 @@
   }
 
   function applySearch() {
-    clearTimeout(debounceTimer); // [수정] 대기 중인 디바운스 요청 취소 → [조회] 클릭 시 요청 1회만
+    clearTimeout(debounceTimer); // [비동기 요청 개선] 대기 중인 디바운스 요청 취소 → [조회] 클릭 시 요청 1회만 수행하도록 개선
     state.search = document.getElementById('searchInput').value.trim();
     state.page = 1;
     resetCursor();
@@ -517,7 +517,7 @@
       let whereClause = state.search ? `WHERE (title LIKE '%${state.search}%' OR content LIKE '%${state.search}%') ` : '';
       sqlBox.textContent = `SELECT id, title, author, views, created_at FROM posts ${whereClause}ORDER BY ${sortClause} LIMIT ${state.limit} OFFSET ${offset};`;
     } else {
-      // [수정] 검색 조건과 커서 조건을 함께 표시
+      // [검색 기능 개선] 검색 조건과 커서 조건을 함께 표시
       const conditions = [];
       if (state.search) conditions.push(`(title LIKE '%${state.search}%' OR content LIKE '%${state.search}%')`);
       if (state.cursor) conditions.push(`id < ${state.cursor}`);
@@ -531,15 +531,15 @@
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       const nextSearch = e.target.value.trim();
-      if (nextSearch === state.search) return; // [수정] 공백만 바뀐 경우 등 검색어가 같으면 요청하지 않음
+      if (nextSearch === state.search) return; // [검색 기능 개선] 앞/뒤 공백을 제거한 검색어가 기존의 검색어와 같으면 별도로 서버에 요청하지 않음
       state.search = nextSearch;
       state.page = 1;
-      resetCursor(); // [수정] 검색어 변경 시 누적 목록·커서 초기화
+      resetCursor(); // [커서 페이징] 검색어가 변경되는 경우 기존 누적 목록과 커서 초기화
       loadData(true);
     }, 300);
   });
 
-  // [수정] Enter 키로도 즉시 조회
+  // [검색 기능 개선] Enter 키로도 즉시 조회가 가능하도록 함
   document.getElementById('searchInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') applySearch();
   });

@@ -60,19 +60,21 @@ const SORT_WHITELIST = Object.freeze({
   views: (a, b) => (b.views !== a.views ? b.views - a.views : b.id - a.id)
 });
 
-// [수정] 쿼리 값이 문자열일 때만 사용 (?search=a&search=b 처럼 배열로 들어오면 무시)
+// [파라미터 방어] 쿼리 값이 문자열이 아니면 빈 문자열로 반환. (search/sort 공용)
 function toQueryString(value) {
   return typeof value === 'string' ? value : '';
 }
 
-// [수정] 정렬 키 검증: 객체가 "직접 가진" 키만 허용
+// [정렬 보안] 정렬 키 검증: 허용되지 않는 정렬 키(ex.hasOwnProperty 등)입력 시 자동 기본값(latest)으로 반환
 // SORT_WHITELIST[key]는 프로토타입까지 조회하므로 __proto__, constructor, hasOwnProperty 등이 통과됨
+// 객체가 가진 키인지만을 확인하고 부모키 까지는 미확인하여 화이트리스트만 허용
 function resolveSortKey(value) {
   const key = toQueryString(value);
   return Object.hasOwn(SORT_WHITELIST, key) ? key : 'latest';
 }
 
-// [수정] 제목·본문 검색 조건을 오프셋/커서 API가 함께 사용 (WHERE title LIKE ? OR content LIKE ?)
+// [검색 기능 개선] 제목·본문 검색 조건을 오프셋/커서 API가 함께 사용 (WHERE title LIKE ? OR content LIKE ?)
+// 오프셋/커서 API가 같은 검색 기준을 사용하도록 함수 통일(기존에는 오프셋 API 안에서만 작동하여 커서 API에서는 검색 기능 미작동)
 function matchesSearch(post, search) {
   if (!search) return true;
   return post.title.toLowerCase().includes(search) || post.content.toLowerCase().includes(search);
@@ -115,7 +117,7 @@ app.get('/api/posts', (req, res) => {
     meta: {
       page: safePage,
       limit,
-      sort: sortKey, // [수정] 서버가 실제 적용한 정렬 키 (잘못된 값이면 latest)
+      sort: sortKey, // [정렬 보안] 서버가 실제 적용한 정렬 키 (잘못된 값이면 latest)
       totalCount,
       totalPages,
       hasNext: safePage < totalPages,
@@ -138,7 +140,8 @@ app.get('/api/posts/cursor', (req, res) => {
   const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 10), 50);
   const search = toQueryString(req.query.search).trim().toLowerCase();
 
-  // [수정] 검색 조건 + 커서 조건을 먼저 모두 적용한 뒤 id DESC 정렬
+  // [검색 기능 개선] 검색 조건 + 커서 조건을 먼저 모두 적용한 뒤 id DESC 정렬
+  // 검색 조건과 커서 조건을 모두 적용하여 표출 후보 게시글 추출
   // (WHERE (title LIKE ? OR content LIKE ?) AND id < ? ORDER BY id DESC)
   const candidate = POSTS
     .filter(p => matchesSearch(p, search))
@@ -147,6 +150,7 @@ app.get('/api/posts/cursor', (req, res) => {
 
   // limit + 1개를 조회하여 다음 데이터 존재 여부(hasNext) 판단 (COUNT(*) 제거)
   // 반드시 조건 적용 "후"에 잘라야 함: 먼저 자르면 검색 결과가 남아 있어도 hasNext=false가 될 수 있음
+  // 순서가 어긋나면 검색 대상이 되는 글이 먼저 잘려 정상적인 조회에 실패할 수 있음
   const sliced = candidate.slice(0, limit + 1);
   const hasNext = sliced.length > limit;
   const items = hasNext ? sliced.slice(0, limit) : sliced;
@@ -162,8 +166,8 @@ app.get('/api/posts/cursor', (req, res) => {
       cursor,
       nextCursor,
       limit,
-      search, // [수정] 서버가 적용한 검색어
-      order: 'id DESC', // [수정] 커서 정렬 기준 명시
+      search, // [메타데이터 수정] 서버가 적용한 검색어 명시
+      order: 'id DESC', // [메타데이터 수정] 커서 정렬 기준 명시
       hasNext,
       executionTimeMs: Number(executionTimeMs)
     }
